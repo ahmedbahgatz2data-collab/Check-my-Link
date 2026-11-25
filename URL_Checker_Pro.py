@@ -15,7 +15,7 @@ import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
-# إعداد المظهر الافتراضي (Light Mode)
+# Default Light Mode appearance
 ctk.set_appearance_mode("Light")
 ctk.set_default_color_theme("blue")
 
@@ -26,8 +26,18 @@ DEFAULT_HEADERS = {
         "Chrome/130.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,de;q=0.8,ar;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
 }
+
+BLOCK_MARKERS = (
+    "access denied",
+    "request blocked",
+    "bot detection",
+    "captcha",
+    "enable javascript and cookies",
+    "perimeterx",
+    "akamai",
+)
 
 
 def normalize_url(raw: str) -> str:
@@ -40,7 +50,7 @@ def normalize_url(raw: str) -> str:
 
 
 def extract_meta_or_canonical_redirect(html_text: str, base_url: str) -> str:
-    """يبحث عن تحويل Meta Refresh أو Canonical داخل HTML في حال عدم وجود تحويل HTTP."""
+    """Extracts Meta Refresh or Canonical URL from HTML if present."""
     if not html_text:
         return ""
     try:
@@ -74,20 +84,34 @@ def extract_title_from_html(html_text: str) -> str:
     return ""
 
 
-class PlaywrightChecker:
-    """يدير متصفح Edge أو Chrome المثبت على النظام عبر Playwright بدون تضمين Chromium."""
+def looks_blocked_or_js_gated(status_code: str, title: str, html_text: str, final_url: str) -> bool:
+    code_str = str(status_code).strip()
+    title_l = (title or "").lower()
+    html_l = (html_text or "")[:4000].lower()
+
+    if code_str in ("403", "429", "503"):
+        return True
+    if any(m in title_l for m in BLOCK_MARKERS):
+        return True
+    if any(m in html_l for m in BLOCK_MARKERS):
+        return True
+    if "eshop.wuerth" in (final_url or "").lower() and not title.strip():
+        return True
+    return False
+
+
+class ThreadLocalBrowserChecker:
+    """Creates and manages a dedicated Playwright browser instance per worker thread."""
 
     def __init__(self, timeout_sec: float = 20.0, headless: bool = True, browser_channel: str = "auto"):
         self.timeout_ms = int(timeout_sec * 1000)
         self.headless = headless
         self.browser_channel = browser_channel
-        self.active_channel = ""
-        self._playwright = None
-        self._browser = None
-        self._context = None
-        self._lock = threading.Lock()
+        self._local = threading.local()
+        self._instances_lock = threading.Lock()
+        self._instances: list[tuple] = []
 
-    def _launch_system_browser(self):
+    def _launch_browser(self, pw):
         if self.browser_channel == "msedge":
             channels = ["msedge"]
         elif self.browser_channel == "chrome":
@@ -95,39 +119,67 @@ class PlaywrightChecker:
         else:
             channels = ["msedge", "chrome"]
 
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+
         last_err = None
         for ch in channels:
             try:
-                browser = self._playwright.chromium.launch(channel=ch, headless=self.headless)
-                self.active_channel = ch
-                return browser
+                browser = pw.chromium.launch(
+                    channel=ch,
+                    headless=self.headless,
+                    args=launch_args,
+                )
+                return browser, ch
             except Exception as exc:
                 last_err = exc
 
         raise RuntimeError(
-            f"تعذر تشغيل متصفح النظام ({', '.join(channels)}). تأكد من تثبيت Microsoft Edge أو Google Chrome.\n{last_err}"
+            f"Unable to launch system browser ({', '.join(channels)}). "
+            f"Ensure Microsoft Edge or Google Chrome is installed.\n{last_err}"
         )
 
-    def start(self):
-        with self._lock:
-            if self._browser is None:
-                self._playwright = sync_playwright().start()
-                self._browser = self._launch_system_browser()
-                self._context = self._browser.new_context(
-                    user_agent=DEFAULT_HEADERS["User-Agent"],
-                    ignore_https_errors=True,
-                )
+    def _get_thread_session(self):
+        session = getattr(self._local, "session", None)
+        if session is not None:
+            return session
+
+        pw = sync_playwright().start()
+        try:
+            browser, ch = self._launch_browser(pw)
+            context = browser.new_context(
+                user_agent=DEFAULT_HEADERS["User-Agent"],
+                ignore_https_errors=True,
+                viewport={"width": 1366, "height": 768},
+            )
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+        except Exception:
+            try:
+                pw.stop()
+            except Exception:
+                pass
+            raise
+
+        session = {"pw": pw, "browser": browser, "context": context, "channel": ch}
+        self._local.session = session
+        with self._instances_lock:
+            self._instances.append(session)
+        return session
 
     def check_url(self, url: str, wait_extra_sec: float = 2.0) -> dict:
         start_t = time.perf_counter()
         chain = [url]
         page = None
+        channel_used = self.browser_channel
         try:
-            with self._lock:
-                if self._browser is None:
-                    self.start()
-                page = self._context.new_page()
-
+            session = self._get_thread_session()
+            channel_used = session["channel"]
+            page = session["context"].new_page()
             page.set_default_timeout(self.timeout_ms)
 
             def on_response(resp):
@@ -160,6 +212,7 @@ class PlaywrightChecker:
 
             title = ""
             size_bytes = 0
+            content = ""
             try:
                 title = re.sub(r"\s+", " ", page.title() or "").strip()
                 content = page.content() or ""
@@ -169,20 +222,22 @@ class PlaywrightChecker:
 
             elapsed_ms = int((time.perf_counter() - start_t) * 1000)
             redirect_count = max(0, len(chain) - 1)
-            engine_label = f"PW-{self.active_channel or 'browser'}"
+            code_int = status_code if isinstance(status_code, int) else None
+            blocked = looks_blocked_or_js_gated(str(status_code), title, content, final_url)
+            is_ok = (code_int is not None and 200 <= code_int < 400 and not blocked)
 
             return {
                 "original_url": url,
                 "final_url": final_url,
                 "redirect_count": redirect_count,
                 "redirect_chain": " -> ".join(chain),
-                "status_code": str(status_code),
+                "status_code": str(status_code) if status_code != "" else "200",
                 "title": title,
                 "size_bytes": size_bytes,
                 "response_ms": elapsed_ms,
-                "mode": engine_label,
-                "error": "",
-                "status_bucket": "success" if (isinstance(status_code, int) and 200 <= status_code < 400) else "error",
+                "mode": f"PW-{channel_used}",
+                "error": "Blocked / Access Denied" if blocked and not is_ok else "",
+                "status_bucket": "success" if is_ok else "error",
             }
         except Exception as exc:
             elapsed_ms = int((time.perf_counter() - start_t) * 1000)
@@ -195,7 +250,7 @@ class PlaywrightChecker:
                 "title": "",
                 "size_bytes": 0,
                 "response_ms": elapsed_ms,
-                "mode": f"PW-{self.active_channel or 'browser'}",
+                "mode": f"PW-{channel_used}",
                 "error": str(exc).splitlines()[0][:180],
                 "status_bucket": "error",
             }
@@ -206,20 +261,18 @@ class PlaywrightChecker:
                 except Exception:
                     pass
 
-    def close(self):
-        with self._lock:
-            for obj in (self._context, self._browser, self._playwright):
+    def close_all(self):
+        with self._instances_lock:
+            instances = list(self._instances)
+            self._instances.clear()
+        for session in instances:
+            for key, method in (("context", "close"), ("browser", "close"), ("pw", "stop")):
+                obj = session.get(key)
                 if obj is not None:
                     try:
-                        if hasattr(obj, "close"):
-                            obj.close()
-                        elif hasattr(obj, "stop"):
-                            obj.stop()
+                        getattr(obj, method)()
                     except Exception:
                         pass
-            self._context = None
-            self._browser = None
-            self._playwright = None
 
 
 class URLCheckerApp(ctk.CTk):
@@ -235,7 +288,7 @@ class URLCheckerApp(ctk.CTk):
         self.is_running = False
 
         self.results: list[dict] = []
-        self.pw_checker: PlaywrightChecker | None = None
+        self.browser_checker: ThreadLocalBrowserChecker | None = None
 
         self._build_ui()
         self._apply_treeview_style()
@@ -245,38 +298,39 @@ class URLCheckerApp(ctk.CTk):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
 
+        # Header Bar
         header_frame = ctk.CTkFrame(self, corner_radius=10)
         header_frame.grid(row=0, column=0, padx=14, pady=(12, 6), sticky="ew")
         header_frame.grid_columnconfigure(1, weight=1)
 
-        title_lbl = ctk.CTkLabel(
+        ctk.CTkLabel(
             header_frame,
             text="URL Checker Pro",
             font=ctk.CTkFont(size=22, weight="bold"),
-        )
-        title_lbl.grid(row=0, column=0, padx=16, pady=10, sticky="w")
+        ).grid(row=0, column=0, padx=16, pady=10, sticky="w")
 
-        subtitle_lbl = ctk.CTkLabel(
+        ctk.CTkLabel(
             header_frame,
-            text="تتبع التحويلات (HTTP & System Edge/Chrome) • فحص متوازي • تصدير XLSX / CSV / TXT",
+            text="Redirect Chain Tracker (HTTP & System Edge/Chrome) • Multi-Threaded • Export XLSX / CSV / TXT",
             font=ctk.CTkFont(size=12),
             text_color="#4B5563",
-        )
-        subtitle_lbl.grid(row=0, column=1, padx=8, pady=10, sticky="w")
+        ).grid(row=0, column=1, padx=8, pady=10, sticky="w")
 
         self.stats_lbl = ctk.CTkLabel(
             header_frame,
-            text="الإجمالي: 0 | ناجح: 0 | أخطاء/متوقف: 0",
+            text="Total: 0 | Success: 0 | Errors/Stopped: 0",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color="#1D4ED8",
         )
         self.stats_lbl.grid(row=0, column=2, padx=16, pady=10, sticky="e")
 
+        # Input & Controls Grid
         top_grid = ctk.CTkFrame(self, fg_color="transparent")
         top_grid.grid(row=1, column=0, padx=14, pady=6, sticky="ew")
         top_grid.grid_columnconfigure(0, weight=2)
         top_grid.grid_columnconfigure(1, weight=1)
 
+        # Input Card
         input_card = ctk.CTkFrame(top_grid, corner_radius=10)
         input_card.grid(row=0, column=0, padx=(0, 6), sticky="nsew")
         input_card.grid_columnconfigure(0, weight=1)
@@ -285,14 +339,14 @@ class URLCheckerApp(ctk.CTk):
         in_bar = ctk.CTkFrame(input_card, fg_color="transparent")
         in_bar.grid(row=0, column=0, padx=12, pady=(10, 4), sticky="ew")
 
-        ctk.CTkLabel(in_bar, text="قائمة الروابط (رابط في كل سطر):", font=ctk.CTkFont(weight="bold")).pack(side="left")
+        ctk.CTkLabel(in_bar, text="URLs List (one URL per line):", font=ctk.CTkFont(weight="bold")).pack(side="left")
 
         ctk.CTkButton(
-            in_bar, text="تحميل ملف (.txt / .csv / .xlsx)", width=180, height=28, command=self.load_urls_file
+            in_bar, text="Load File (.txt / .csv / .xlsx)", width=185, height=28, command=self.load_urls_file
         ).pack(side="right", padx=(6, 0))
         ctk.CTkButton(
             in_bar,
-            text="حذف المكرر",
+            text="Deduplicate",
             width=105,
             height=28,
             fg_color="#475569",
@@ -301,7 +355,7 @@ class URLCheckerApp(ctk.CTk):
         ).pack(side="right", padx=(6, 0))
         ctk.CTkButton(
             in_bar,
-            text="مسح",
+            text="Clear",
             width=70,
             height=28,
             fg_color="#DC2626",
@@ -316,15 +370,16 @@ class URLCheckerApp(ctk.CTk):
             "https://eshop.wuerth.de/is-bin/INTERSHOP.enfinity/WFS/1401-B1-Site/en_US/-/EUR/ViewAfterSearch-ExecuteAfterSearch?SearchResultType=&EffectiveSearchTerm=&VisibleSearchTerm=04601012\n",
         )
 
+        # Settings & Controls Card
         ctrl_card = ctk.CTkFrame(top_grid, corner_radius=10)
         ctrl_card.grid(row=0, column=1, padx=(6, 0), sticky="nsew")
         ctrl_card.grid_columnconfigure((0, 1, 2), weight=1)
 
-        ctk.CTkLabel(ctrl_card, text="إعدادات الفحص والتحكم", font=ctk.CTkFont(weight="bold")).grid(
+        ctk.CTkLabel(ctrl_card, text="Scan Settings & Controls", font=ctk.CTkFont(weight="bold")).grid(
             row=0, column=0, columnspan=3, padx=12, pady=(10, 6), sticky="w"
         )
 
-        ctk.CTkLabel(ctrl_card, text="وضع الفحص:").grid(row=1, column=0, padx=10, pady=3, sticky="w")
+        ctk.CTkLabel(ctrl_card, text="Scan Mode:").grid(row=1, column=0, padx=10, pady=3, sticky="w")
         self.mode_var = ctk.StringVar(value="Smart (HTTP + System Browser)")
         self.mode_menu = ctk.CTkOptionMenu(
             ctrl_card,
@@ -337,7 +392,7 @@ class URLCheckerApp(ctk.CTk):
         )
         self.mode_menu.grid(row=1, column=1, columnspan=2, padx=10, pady=3, sticky="ew")
 
-        ctk.CTkLabel(ctrl_card, text="المتصفح:").grid(row=2, column=0, padx=10, pady=3, sticky="w")
+        ctk.CTkLabel(ctrl_card, text="Browser:").grid(row=2, column=0, padx=10, pady=3, sticky="w")
         self.channel_var = ctk.StringVar(value="Auto (Edge -> Chrome)")
         self.channel_menu = ctk.CTkOptionMenu(
             ctrl_card,
@@ -350,22 +405,22 @@ class URLCheckerApp(ctk.CTk):
         )
         self.channel_menu.grid(row=2, column=1, columnspan=2, padx=10, pady=3, sticky="ew")
 
-        ctk.CTkLabel(ctrl_card, text="Timeout (ث):").grid(row=3, column=0, padx=10, pady=3, sticky="w")
-        self.timeout_entry = ctk.CTkEntry(ctrl_card, width=70)
+        ctk.CTkLabel(ctrl_card, text="Timeout (s):").grid(row=3, column=0, padx=10, pady=3, sticky="w")
+        self.timeout_entry = ctk.CTkEntry(ctrl_card, width=65)
         self.timeout_entry.insert(0, "15")
         self.timeout_entry.grid(row=3, column=1, padx=4, pady=3, sticky="w")
 
-        ctk.CTkLabel(ctrl_card, text="Threads:").grid(row=3, column=1, padx=(50, 0), pady=3, sticky="e")
+        ctk.CTkLabel(ctrl_card, text="Threads:").grid(row=3, column=1, padx=(52, 0), pady=3, sticky="e")
         self.threads_entry = ctk.CTkEntry(ctrl_card, width=55)
         self.threads_entry.insert(0, "8")
         self.threads_entry.grid(row=3, column=2, padx=10, pady=3, sticky="e")
 
-        ctk.CTkLabel(ctrl_card, text="إعادة محاولة:").grid(row=4, column=0, padx=10, pady=3, sticky="w")
-        self.retries_entry = ctk.CTkEntry(ctrl_card, width=70)
+        ctk.CTkLabel(ctrl_card, text="Retries:").grid(row=4, column=0, padx=10, pady=3, sticky="w")
+        self.retries_entry = ctk.CTkEntry(ctrl_card, width=65)
         self.retries_entry.insert(0, "1")
         self.retries_entry.grid(row=4, column=1, padx=4, pady=3, sticky="w")
 
-        self.headless_var = ctk.BooleanVar(value=True)
+        self.headless_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(ctrl_card, text="Headless", variable=self.headless_var).grid(
             row=4, column=2, padx=10, pady=3, sticky="e"
         )
@@ -375,13 +430,13 @@ class URLCheckerApp(ctk.CTk):
         btn_row1.grid_columnconfigure((0, 1, 2), weight=1)
 
         self.start_btn = ctk.CTkButton(
-            btn_row1, text="▶ بدء الفحص", fg_color="#16A34A", hover_color="#15803D", command=self.start_check
+            btn_row1, text="▶ Start Scan", fg_color="#16A34A", hover_color="#15803D", command=self.start_check
         )
         self.start_btn.grid(row=0, column=0, padx=3, sticky="ew")
 
         self.pause_btn = ctk.CTkButton(
             btn_row1,
-            text="⏸ إيقاف مؤقت",
+            text="⏸ Pause",
             fg_color="#D97706",
             hover_color="#B45309",
             state="disabled",
@@ -391,7 +446,7 @@ class URLCheckerApp(ctk.CTk):
 
         self.stop_btn = ctk.CTkButton(
             btn_row1,
-            text="⏹ إيقاف",
+            text="⏹ Stop",
             fg_color="#DC2626",
             hover_color="#B91C1C",
             state="disabled",
@@ -405,7 +460,7 @@ class URLCheckerApp(ctk.CTk):
 
         self.retry_failed_btn = ctk.CTkButton(
             btn_row2,
-            text="↻ إعادة فحص الفاشلة",
+            text="↻ Retry Failed",
             fg_color="#2563EB",
             hover_color="#1D4ED8",
             command=self.retry_failed,
@@ -414,13 +469,14 @@ class URLCheckerApp(ctk.CTk):
 
         self.clear_res_btn = ctk.CTkButton(
             btn_row2,
-            text="تصفير النتائج",
+            text="Clear Results",
             fg_color="#64748B",
             hover_color="#475569",
             command=self.clear_results,
         )
         self.clear_res_btn.grid(row=0, column=1, padx=3, sticky="ew")
 
+        # Results Card
         table_card = ctk.CTkFrame(self, corner_radius=10)
         table_card.grid(row=2, column=0, padx=14, pady=(6, 12), sticky="nsew")
         table_card.grid_columnconfigure(0, weight=1)
@@ -429,24 +485,24 @@ class URLCheckerApp(ctk.CTk):
         toolbar = ctk.CTkFrame(table_card, fg_color="transparent")
         toolbar.grid(row=0, column=0, padx=12, pady=(10, 6), sticky="ew")
 
-        ctk.CTkLabel(toolbar, text="فلترة:").pack(side="left", padx=(0, 4))
-        self.filter_var = ctk.StringVar(value="الكل")
+        ctk.CTkLabel(toolbar, text="Filter:").pack(side="left", padx=(0, 4))
+        self.filter_var = ctk.StringVar(value="All")
         self.filter_menu = ctk.CTkOptionMenu(
             toolbar,
             variable=self.filter_var,
-            values=["الكل", "ناجح (2xx/3xx)", "مُحوّل (Redirects)", "أخطاء / فاشل"],
-            width=160,
+            values=["All", "Success (2xx/3xx)", "Redirected", "Errors / Failed"],
+            width=150,
             command=lambda _: self.refresh_table(),
         )
         self.filter_menu.pack(side="left", padx=(0, 8))
 
-        self.search_entry = ctk.CTkEntry(toolbar, placeholder_text="بحث في الرابط أو العنوان...", width=240)
+        self.search_entry = ctk.CTkEntry(toolbar, placeholder_text="Search URL, title, status...", width=240)
         self.search_entry.pack(side="left")
         self.search_entry.bind("<KeyRelease>", lambda _: self.refresh_table())
 
         ctk.CTkButton(
             toolbar,
-            text="تصدير XLSX",
+            text="Export XLSX",
             width=110,
             fg_color="#0F766E",
             hover_color="#115E59",
@@ -454,7 +510,7 @@ class URLCheckerApp(ctk.CTk):
         ).pack(side="right", padx=(6, 0))
         ctk.CTkButton(
             toolbar,
-            text="تصدير CSV",
+            text="Export CSV",
             width=105,
             fg_color="#0369A1",
             hover_color="#075985",
@@ -462,7 +518,7 @@ class URLCheckerApp(ctk.CTk):
         ).pack(side="right", padx=(6, 0))
         ctk.CTkButton(
             toolbar,
-            text="تصدير TXT (Tab)",
+            text="Export TXT (Tab)",
             width=120,
             fg_color="#374151",
             hover_color="#1F2937",
@@ -567,7 +623,7 @@ class URLCheckerApp(ctk.CTk):
 
     def load_urls_file(self):
         path = filedialog.askopenfilename(
-            title="اختر ملف الروابط",
+            title="Select URLs File",
             filetypes=[
                 ("Supported Files", "*.txt *.csv *.xlsx"),
                 ("Text Files", "*.txt"),
@@ -606,11 +662,11 @@ class URLCheckerApp(ctk.CTk):
             if urls:
                 self.url_textbox.delete("1.0", "end")
                 self.url_textbox.insert("1.0", "\n".join(urls) + "\n")
-                messagebox.showinfo("تم التحميل", f"تم تحميل {len(urls)} رابط بنجاح.")
+                messagebox.showinfo("Loaded", f"Loaded {len(urls)} URLs successfully.")
             else:
-                messagebox.showwarning("تنبيه", "لم يتم العثور على روابط صالحة في الملف.")
+                messagebox.showwarning("No URLs", "No valid URLs were found in the selected file.")
         except Exception as exc:
-            messagebox.showerror("خطأ", f"تعذر قراءة الملف:\n{exc}")
+            messagebox.showerror("File Error", f"Failed to read file:\n{exc}")
 
     def deduplicate_input(self):
         raw_lines = self.url_textbox.get("1.0", "end").splitlines()
@@ -624,7 +680,7 @@ class URLCheckerApp(ctk.CTk):
         self.url_textbox.delete("1.0", "end")
         if unique:
             self.url_textbox.insert("1.0", "\n".join(unique) + "\n")
-        messagebox.showinfo("تمت التصفية", f"الروابط الفريدة: {len(unique)}")
+        messagebox.showinfo("Deduplicated", f"Unique URLs: {len(unique)}")
 
     def clear_input(self):
         self.url_textbox.delete("1.0", "end")
@@ -661,6 +717,8 @@ class URLCheckerApp(ctk.CTk):
                 html_text = resp.text if "text/html" in resp.headers.get("Content-Type", "").lower() else ""
                 title = extract_title_from_html(html_text)
                 meta_target = extract_meta_or_canonical_redirect(html_text, final_url)
+                blocked = looks_blocked_or_js_gated(str(resp.status_code), title, html_text, final_url)
+                is_ok = (200 <= resp.status_code < 400) and not blocked
 
                 elapsed_ms = int((time.perf_counter() - start_t) * 1000)
                 return {
@@ -673,10 +731,9 @@ class URLCheckerApp(ctk.CTk):
                     "size_bytes": len(resp.content),
                     "response_ms": elapsed_ms,
                     "mode": "HTTP",
-                    "error": "",
-                    "status_bucket": "success" if 200 <= resp.status_code < 400 else "error",
-                    "_needs_js": bool(meta_target and meta_target != final_url)
-                    or ("eshop.wuerth" in final_url.lower() and not title),
+                    "error": "Blocked / Access Denied" if blocked and not is_ok else "",
+                    "status_bucket": "success" if is_ok else "error",
+                    "_needs_js": bool(meta_target and meta_target != final_url) or blocked,
                 }
         except Exception as exc:
             elapsed_ms = int((time.perf_counter() - start_t) * 1000)
@@ -703,18 +760,22 @@ class URLCheckerApp(ctk.CTk):
             self.pause_event.wait()
 
             if mode == "System Browser Only":
-                res = self.pw_checker.check_url(url) if self.pw_checker else self._check_single_http(url, timeout_sec)
+                res = (
+                    self.browser_checker.check_url(url)
+                    if self.browser_checker
+                    else self._check_single_http(url, timeout_sec)
+                )
             elif mode == "Fast HTTP Only":
                 res = self._check_single_http(url, timeout_sec)
             else:
                 res = self._check_single_http(url, timeout_sec)
                 if (
                     (res.get("_needs_js") or res["status_bucket"] == "error")
-                    and self.pw_checker
+                    and self.browser_checker
                     and not self.stop_event.is_set()
                 ):
-                    pw_res = self.pw_checker.check_url(url)
-                    if pw_res["status_bucket"] == "success" or pw_res["final_url"] != url:
+                    pw_res = self.browser_checker.check_url(url)
+                    if pw_res["status_bucket"] == "success" or pw_res["final_url"] != url or pw_res["title"]:
                         res = pw_res
 
             last_res = res
@@ -751,7 +812,7 @@ class URLCheckerApp(ctk.CTk):
             urls = [normalize_url(x) for x in raw_lines if normalize_url(x)]
 
         if not urls:
-            messagebox.showwarning("تنبيه", "الرجاء إدخال رابط واحد على الأقل.")
+            messagebox.showwarning("Missing URLs", "Please enter at least one URL.")
             return
 
         try:
@@ -759,7 +820,7 @@ class URLCheckerApp(ctk.CTk):
             threads = max(1, min(50, int(self.threads_entry.get().strip())))
             retries = max(0, min(5, int(self.retries_entry.get().strip())))
         except ValueError:
-            messagebox.showerror("خطأ في الإعدادات", "تأكد من إدخال أرقام صحيحة لـ Timeout و Threads و Retries.")
+            messagebox.showerror("Invalid Settings", "Please enter valid numbers for Timeout, Threads, and Retries.")
             return
 
         mode = self.mode_var.get()
@@ -775,7 +836,7 @@ class URLCheckerApp(ctk.CTk):
             self.refresh_table()
 
         self.start_btn.configure(state="disabled")
-        self.pause_btn.configure(state="normal", text="⏸ إيقاف مؤقت")
+        self.pause_btn.configure(state="normal", text="⏸ Pause")
         self.stop_btn.configure(state="normal")
         self.retry_failed_btn.configure(state="disabled")
 
@@ -792,23 +853,13 @@ class URLCheckerApp(ctk.CTk):
         done = 0
         try:
             if use_pw:
-                self.pw_checker = PlaywrightChecker(
+                self.browser_checker = ThreadLocalBrowserChecker(
                     timeout_sec=max(timeout_sec, 15.0),
                     headless=self.headless_var.get(),
                     browser_channel=channel,
                 )
-                try:
-                    self.pw_checker.start()
-                except Exception as exc:
-                    self.after(
-                        0,
-                        lambda: messagebox.showwarning(
-                            "System Browser", f"تعذر تشغيل متصفح النظام، سيتم الاعتماد على HTTP:\n{exc}"
-                        ),
-                    )
-                    self.pw_checker = None
 
-            effective_threads = 1 if (mode == "System Browser Only" and threads > 4) else threads
+            effective_threads = min(threads, 3) if mode == "System Browser Only" else threads
             with ThreadPoolExecutor(max_workers=effective_threads) as pool:
                 futures = {pool.submit(self._check_with_retries, u, mode, timeout_sec, retries): u for u in urls}
                 for fut in as_completed(futures):
@@ -820,9 +871,9 @@ class URLCheckerApp(ctk.CTk):
                     done += 1
                     self.after(0, lambda r=res, d=done, t=total: self._on_item_done(r, d, t))
         finally:
-            if self.pw_checker is not None:
-                self.pw_checker.close()
-                self.pw_checker = None
+            if self.browser_checker is not None:
+                self.browser_checker.close_all()
+                self.browser_checker = None
             self.after(0, self._on_finished)
 
     def _on_item_done(self, item: dict, done: int, total: int):
@@ -844,7 +895,7 @@ class URLCheckerApp(ctk.CTk):
     def _on_finished(self):
         self.is_running = False
         self.start_btn.configure(state="normal")
-        self.pause_btn.configure(state="disabled", text="⏸ إيقاف مؤقت")
+        self.pause_btn.configure(state="disabled", text="⏸ Pause")
         self.stop_btn.configure(state="disabled")
         self.retry_failed_btn.configure(state="normal")
         self._update_stats()
@@ -854,10 +905,10 @@ class URLCheckerApp(ctk.CTk):
             return
         if self.pause_event.is_set():
             self.pause_event.clear()
-            self.pause_btn.configure(text="▶ استئناف")
+            self.pause_btn.configure(text="▶ Resume")
         else:
             self.pause_event.set()
-            self.pause_btn.configure(text="⏸ إيقاف مؤقت")
+            self.pause_btn.configure(text="⏸ Pause")
 
     def stop_check(self):
         if not self.is_running:
@@ -870,7 +921,7 @@ class URLCheckerApp(ctk.CTk):
             return
         failed_urls = [r["original_url"] for r in self.results if r["status_bucket"] != "success"]
         if not failed_urls:
-            messagebox.showinfo("لا توجد أخطاء", "لا توجد روابط فاشلة لإعادة فحصها.")
+            messagebox.showinfo("No Errors", "There are no failed URLs to retry.")
             return
         self.start_check(custom_urls=failed_urls)
 
@@ -878,7 +929,7 @@ class URLCheckerApp(ctk.CTk):
         total = len(self.results)
         ok_cnt = sum(1 for r in self.results if r["status_bucket"] == "success")
         err_cnt = total - ok_cnt
-        self.stats_lbl.configure(text=f"الإجمالي: {total} | ناجح: {ok_cnt} | أخطاء/متوقف: {err_cnt}")
+        self.stats_lbl.configure(text=f"Total: {total} | Success: {ok_cnt} | Errors/Stopped: {err_cnt}")
 
     def refresh_table(self):
         flt = self.filter_var.get()
@@ -889,11 +940,11 @@ class URLCheckerApp(ctk.CTk):
 
         idx = 0
         for r in self.results:
-            if flt == "ناجح (2xx/3xx)" and r["status_bucket"] != "success":
+            if flt == "Success (2xx/3xx)" and r["status_bucket"] != "success":
                 continue
-            if flt == "مُحوّل (Redirects)" and r["redirect_count"] <= 0:
+            if flt == "Redirected" and r["redirect_count"] <= 0:
                 continue
-            if flt == "أخطاء / فاشل" and r["status_bucket"] == "success":
+            if flt == "Errors / Failed" and r["status_bucket"] == "success":
                 continue
 
             haystack = f"{r['original_url']} {r['final_url']} {r['title']} {r['status_code']} {r['error']}".lower()
@@ -922,13 +973,13 @@ class URLCheckerApp(ctk.CTk):
 
     def export_data(self, fmt: str):
         if not self.results:
-            messagebox.showwarning("تنبيه", "لا توجد نتائج لتصديرها.")
+            messagebox.showwarning("No Data", "There are no results to export.")
             return
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         default_name = f"URL_Check_Report_{stamp}.{fmt}"
         path = filedialog.asksaveasfilename(
-            title="حفظ التقرير",
+            title="Save Report",
             initialfile=default_name,
             defaultextension=f".{fmt}",
             filetypes=[(f"{fmt.upper()} Files", f"*.{fmt}")],
@@ -998,15 +1049,15 @@ class URLCheckerApp(ctk.CTk):
 
                 wb.save(path)
 
-            messagebox.showinfo("تم التصدير", f"تم حفظ الملف بنجاح:\n{path}")
+            messagebox.showinfo("Exported", f"Report saved successfully:\n{path}")
         except Exception as exc:
-            messagebox.showerror("خطأ في التصدير", f"تعذر حفظ الملف:\n{exc}")
+            messagebox.showerror("Export Error", f"Failed to save report:\n{exc}")
 
     def _on_close(self):
         self.stop_event.set()
         self.pause_event.set()
-        if self.pw_checker is not None:
-            self.pw_checker.close()
+        if self.browser_checker is not None:
+            self.browser_checker.close_all()
         self.destroy()
 
 
