@@ -1,10 +1,9 @@
-# URL Checker Pro — By ENG Ahmed Bahgat
+# URL Checker Pro (Lite Edition) — By ENG Ahmed Bahgat
 
-أداة سطح مكتب احترافية بلغة Python لفحص الروابط وتتبع التحويلات النهائية (HTTP Redirects & JavaScript/Meta Redirects) باستخدام `requests` و `Playwright`.
+أداة سطح مكتب خفيفة وسريعة بلغة Python لفحص الروابط وتتبع التحويلات النهائية (HTTP & JavaScript/Meta Redirects) بالاعتماد على متصفح النظام المثبت (**Microsoft Edge** أو **Google Chrome**) لتقليل حجم البرنامج إلى الحد الأدنى.
 
 ## المميزات
-- **وضع الفحص الذكي (`Smart HTTP + Playwright JS`):** فحص سريع عبر HTTP مع التحويل التلقائي إلى متصفح Chromium عبر Playwright عند الحاجة.
-- **فحص متوازي (Multi-Threading):** دعم تشغيل عدة خيوط في نفس الوقت لتسريع الفحص.
-- **تتبع كامل للتحويلات:** استخراج الرابط النهائي، عدد القفزات، سلسلة التحويلات كاملة، عنوان الصفحة، حجم المحتوى، وزمن الاستجابة.
-- **تصدير متعدد الصيغ:** `.xlsx` و `.csv` و `.txt` (Tab-delimited).
-- **بناء تلقائي عبر GitHub Actions:** يقوم ملف `.github/workflows/build.yml` بتجميع البرنامج تلقائياً إلى `.exe` ونشره في قسم **Releases** مع كل رفع إلى `main` أو عند إنشاء Tag جديد.
+- **حجم صغير وملف تنفيذي واحد (`URL_Checker_Pro.exe`):** بدون تضمين متصفح Chromium الضخم، حيث يستخدم تلقائياً `channel="msedge"` أو `channel="chrome"` المثبت على جهازك.
+- **وضع الفحص الذكي (`Smart HTTP + System Browser`):** فحص سريع عبر HTTP مع التحويل التلقائي إلى متصفح النظام عند الحاجة.
+- **فحص متوازي (Multi-Threading) وتصدير متعدد:** يدعم `.xlsx` و `.csv` و `.txt` (Tab-delimited).
+- **بناء ونشر تلقائي على GitHub Releases:** يعمل تلقائياً عند الرفع إلى `main` أو عند إنشاء `Tag` جديد.

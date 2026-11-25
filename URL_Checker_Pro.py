@@ -75,21 +75,44 @@ def extract_title_from_html(html_text: str) -> str:
 
 
 class PlaywrightChecker:
-    """يدير متصفح Playwright بأمان لفحص الروابط المعتمدة على JavaScript."""
+    """يدير متصفح Edge أو Chrome المثبت على النظام عبر Playwright بدون تضمين Chromium."""
 
-    def __init__(self, timeout_sec: float = 20.0, headless: bool = True):
+    def __init__(self, timeout_sec: float = 20.0, headless: bool = True, browser_channel: str = "auto"):
         self.timeout_ms = int(timeout_sec * 1000)
         self.headless = headless
+        self.browser_channel = browser_channel
+        self.active_channel = ""
         self._playwright = None
         self._browser = None
         self._context = None
         self._lock = threading.Lock()
 
+    def _launch_system_browser(self):
+        if self.browser_channel == "msedge":
+            channels = ["msedge"]
+        elif self.browser_channel == "chrome":
+            channels = ["chrome"]
+        else:
+            channels = ["msedge", "chrome"]
+
+        last_err = None
+        for ch in channels:
+            try:
+                browser = self._playwright.chromium.launch(channel=ch, headless=self.headless)
+                self.active_channel = ch
+                return browser
+            except Exception as exc:
+                last_err = exc
+
+        raise RuntimeError(
+            f"تعذر تشغيل متصفح النظام ({', '.join(channels)}). تأكد من تثبيت Microsoft Edge أو Google Chrome.\n{last_err}"
+        )
+
     def start(self):
         with self._lock:
             if self._browser is None:
                 self._playwright = sync_playwright().start()
-                self._browser = self._playwright.chromium.launch(headless=self.headless)
+                self._browser = self._launch_system_browser()
                 self._context = self._browser.new_context(
                     user_agent=DEFAULT_HEADERS["User-Agent"],
                     ignore_https_errors=True,
@@ -146,6 +169,7 @@ class PlaywrightChecker:
 
             elapsed_ms = int((time.perf_counter() - start_t) * 1000)
             redirect_count = max(0, len(chain) - 1)
+            engine_label = f"PW-{self.active_channel or 'browser'}"
 
             return {
                 "original_url": url,
@@ -156,7 +180,7 @@ class PlaywrightChecker:
                 "title": title,
                 "size_bytes": size_bytes,
                 "response_ms": elapsed_ms,
-                "mode": "Playwright",
+                "mode": engine_label,
                 "error": "",
                 "status_bucket": "success" if (isinstance(status_code, int) and 200 <= status_code < 400) else "error",
             }
@@ -171,7 +195,7 @@ class PlaywrightChecker:
                 "title": "",
                 "size_bytes": 0,
                 "response_ms": elapsed_ms,
-                "mode": "Playwright",
+                "mode": f"PW-{self.active_channel or 'browser'}",
                 "error": str(exc).splitlines()[0][:180],
                 "status_bucket": "error",
             }
@@ -202,7 +226,7 @@ class URLCheckerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("URL Checker Pro — By ENG Ahmed Bahgat")
-        self.geometry("1280x820")
+        self.geometry("1280x830")
         self.minsize(1050, 680)
 
         self.stop_event = threading.Event()
@@ -234,7 +258,7 @@ class URLCheckerApp(ctk.CTk):
 
         subtitle_lbl = ctk.CTkLabel(
             header_frame,
-            text="تتبع التحويلات (HTTP & Playwright JS) • فحص متوازي • تصدير XLSX / CSV / TXT",
+            text="تتبع التحويلات (HTTP & System Edge/Chrome) • فحص متوازي • تصدير XLSX / CSV / TXT",
             font=ctk.CTkFont(size=12),
             text_color="#4B5563",
         )
@@ -285,7 +309,7 @@ class URLCheckerApp(ctk.CTk):
             command=self.clear_input,
         ).pack(side="right")
 
-        self.url_textbox = ctk.CTkTextbox(input_card, height=130, font=ctk.CTkFont(family="Consolas", size=12))
+        self.url_textbox = ctk.CTkTextbox(input_card, height=138, font=ctk.CTkFont(family="Consolas", size=12))
         self.url_textbox.grid(row=1, column=0, padx=12, pady=(0, 10), sticky="nsew")
         self.url_textbox.insert(
             "1.0",
@@ -300,41 +324,54 @@ class URLCheckerApp(ctk.CTk):
             row=0, column=0, columnspan=3, padx=12, pady=(10, 6), sticky="w"
         )
 
-        ctk.CTkLabel(ctrl_card, text="وضع الفحص:").grid(row=1, column=0, padx=10, pady=4, sticky="w")
-        self.mode_var = ctk.StringVar(value="Smart (HTTP + Playwright JS)")
+        ctk.CTkLabel(ctrl_card, text="وضع الفحص:").grid(row=1, column=0, padx=10, pady=3, sticky="w")
+        self.mode_var = ctk.StringVar(value="Smart (HTTP + System Browser)")
         self.mode_menu = ctk.CTkOptionMenu(
             ctrl_card,
             variable=self.mode_var,
             values=[
-                "Smart (HTTP + Playwright JS)",
+                "Smart (HTTP + System Browser)",
                 "Fast HTTP Only",
-                "Playwright Browser Only",
+                "System Browser Only",
             ],
         )
-        self.mode_menu.grid(row=1, column=1, columnspan=2, padx=10, pady=4, sticky="ew")
+        self.mode_menu.grid(row=1, column=1, columnspan=2, padx=10, pady=3, sticky="ew")
 
-        ctk.CTkLabel(ctrl_card, text="Timeout (ث):").grid(row=2, column=0, padx=10, pady=4, sticky="w")
-        self.timeout_entry = ctk.CTkEntry(ctrl_card, width=80)
+        ctk.CTkLabel(ctrl_card, text="المتصفح:").grid(row=2, column=0, padx=10, pady=3, sticky="w")
+        self.channel_var = ctk.StringVar(value="Auto (Edge -> Chrome)")
+        self.channel_menu = ctk.CTkOptionMenu(
+            ctrl_card,
+            variable=self.channel_var,
+            values=[
+                "Auto (Edge -> Chrome)",
+                "Microsoft Edge (msedge)",
+                "Google Chrome (chrome)",
+            ],
+        )
+        self.channel_menu.grid(row=2, column=1, columnspan=2, padx=10, pady=3, sticky="ew")
+
+        ctk.CTkLabel(ctrl_card, text="Timeout (ث):").grid(row=3, column=0, padx=10, pady=3, sticky="w")
+        self.timeout_entry = ctk.CTkEntry(ctrl_card, width=70)
         self.timeout_entry.insert(0, "15")
-        self.timeout_entry.grid(row=2, column=1, padx=4, pady=4, sticky="w")
+        self.timeout_entry.grid(row=3, column=1, padx=4, pady=3, sticky="w")
 
-        ctk.CTkLabel(ctrl_card, text="Threads:").grid(row=2, column=1, padx=(55, 0), pady=4, sticky="e")
-        self.threads_entry = ctk.CTkEntry(ctrl_card, width=60)
+        ctk.CTkLabel(ctrl_card, text="Threads:").grid(row=3, column=1, padx=(50, 0), pady=3, sticky="e")
+        self.threads_entry = ctk.CTkEntry(ctrl_card, width=55)
         self.threads_entry.insert(0, "8")
-        self.threads_entry.grid(row=2, column=2, padx=10, pady=4, sticky="e")
+        self.threads_entry.grid(row=3, column=2, padx=10, pady=3, sticky="e")
 
-        ctk.CTkLabel(ctrl_card, text="إعادة محاولة:").grid(row=3, column=0, padx=10, pady=4, sticky="w")
-        self.retries_entry = ctk.CTkEntry(ctrl_card, width=80)
+        ctk.CTkLabel(ctrl_card, text="إعادة محاولة:").grid(row=4, column=0, padx=10, pady=3, sticky="w")
+        self.retries_entry = ctk.CTkEntry(ctrl_card, width=70)
         self.retries_entry.insert(0, "1")
-        self.retries_entry.grid(row=3, column=1, padx=4, pady=4, sticky="w")
+        self.retries_entry.grid(row=4, column=1, padx=4, pady=3, sticky="w")
 
         self.headless_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(ctrl_card, text="Headless Browser", variable=self.headless_var).grid(
-            row=3, column=2, padx=10, pady=4, sticky="e"
+        ctk.CTkCheckBox(ctrl_card, text="Headless", variable=self.headless_var).grid(
+            row=4, column=2, padx=10, pady=3, sticky="e"
         )
 
         btn_row1 = ctk.CTkFrame(ctrl_card, fg_color="transparent")
-        btn_row1.grid(row=4, column=0, columnspan=3, padx=10, pady=(8, 4), sticky="ew")
+        btn_row1.grid(row=5, column=0, columnspan=3, padx=10, pady=(6, 3), sticky="ew")
         btn_row1.grid_columnconfigure((0, 1, 2), weight=1)
 
         self.start_btn = ctk.CTkButton(
@@ -363,7 +400,7 @@ class URLCheckerApp(ctk.CTk):
         self.stop_btn.grid(row=0, column=2, padx=3, sticky="ew")
 
         btn_row2 = ctk.CTkFrame(ctrl_card, fg_color="transparent")
-        btn_row2.grid(row=5, column=0, columnspan=3, padx=10, pady=(2, 10), sticky="ew")
+        btn_row2.grid(row=6, column=0, columnspan=3, padx=10, pady=(2, 10), sticky="ew")
         btn_row2.grid_columnconfigure((0, 1), weight=1)
 
         self.retry_failed_btn = ctk.CTkButton(
@@ -472,7 +509,7 @@ class URLCheckerApp(ctk.CTk):
             "title": 200,
             "size": 85,
             "ms": 80,
-            "mode": 85,
+            "mode": 95,
             "error": 180,
         }
         for col in columns:
@@ -519,6 +556,14 @@ class URLCheckerApp(ctk.CTk):
         style.theme_use("default")
         style.configure("Treeview", rowheight=26, font=("Segoe UI", 10))
         style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"), background="#E5E7EB", foreground="#111827")
+
+    def _get_selected_channel(self) -> str:
+        val = self.channel_var.get()
+        if "msedge" in val:
+            return "msedge"
+        if "chrome" in val:
+            return "chrome"
+        return "auto"
 
     def load_urls_file(self):
         path = filedialog.askopenfilename(
@@ -657,7 +702,7 @@ class URLCheckerApp(ctk.CTk):
                 break
             self.pause_event.wait()
 
-            if mode == "Playwright Browser Only":
+            if mode == "System Browser Only":
                 res = self.pw_checker.check_url(url) if self.pw_checker else self._check_single_http(url, timeout_sec)
             elif mode == "Fast HTTP Only":
                 res = self._check_single_http(url, timeout_sec)
@@ -718,7 +763,8 @@ class URLCheckerApp(ctk.CTk):
             return
 
         mode = self.mode_var.get()
-        use_pw = mode in ("Smart (HTTP + Playwright JS)", "Playwright Browser Only")
+        use_pw = mode in ("Smart (HTTP + System Browser)", "System Browser Only")
+        channel = self._get_selected_channel()
 
         self.stop_event.clear()
         self.pause_event.set()
@@ -735,17 +781,21 @@ class URLCheckerApp(ctk.CTk):
 
         threading.Thread(
             target=self._worker_runner,
-            args=(urls, mode, timeout_sec, threads, retries, use_pw),
+            args=(urls, mode, timeout_sec, threads, retries, use_pw, channel),
             daemon=True,
         ).start()
 
-    def _worker_runner(self, urls: list[str], mode: str, timeout_sec: float, threads: int, retries: int, use_pw: bool):
+    def _worker_runner(
+        self, urls: list[str], mode: str, timeout_sec: float, threads: int, retries: int, use_pw: bool, channel: str
+    ):
         total = len(urls)
         done = 0
         try:
             if use_pw:
                 self.pw_checker = PlaywrightChecker(
-                    timeout_sec=max(timeout_sec, 15.0), headless=self.headless_var.get()
+                    timeout_sec=max(timeout_sec, 15.0),
+                    headless=self.headless_var.get(),
+                    browser_channel=channel,
                 )
                 try:
                     self.pw_checker.start()
@@ -753,12 +803,12 @@ class URLCheckerApp(ctk.CTk):
                     self.after(
                         0,
                         lambda: messagebox.showwarning(
-                            "Playwright", f"تعذر تشغيل Playwright، سيتم الاعتماد على HTTP:\n{exc}"
+                            "System Browser", f"تعذر تشغيل متصفح النظام، سيتم الاعتماد على HTTP:\n{exc}"
                         ),
                     )
                     self.pw_checker = None
 
-            effective_threads = 1 if (mode == "Playwright Browser Only" and threads > 4) else threads
+            effective_threads = 1 if (mode == "System Browser Only" and threads > 4) else threads
             with ThreadPoolExecutor(max_workers=effective_threads) as pool:
                 futures = {pool.submit(self._check_with_retries, u, mode, timeout_sec, retries): u for u in urls}
                 for fut in as_completed(futures):
