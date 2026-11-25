@@ -1,0 +1,70 @@
+name: Build Windows EXE (URL Checker Pro)
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium Browser (Local Bundle)
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: 0
+        run: |
+          playwright install chromium
+
+      - name: Build Executable with PyInstaller
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: 0
+        run: |
+          $CTK_PATH = python -c "import os, customtkinter; print(os.path.dirname(customtkinter.__file__))"
+          $PW_PATH = python -c "import os, playwright; print(os.path.dirname(playwright.__file__))"
+          pyinstaller --noconfirm --onedir --windowed `
+            --name "URL_Checker_Pro" `
+            --add-data "$CTK_PATH;customtkinter/" `
+            --add-data "$PW_PATH/driver;playwright/driver" `
+            --hidden-import "openpyxl" `
+            --hidden-import "bs4" `
+            --hidden-import "playwright.sync_api" `
+            URL_Checker_Pro.py
+
+      - name: Package Release ZIP
+        run: |
+          Compress-Archive -Path "dist\URL_Checker_Pro\*" -DestinationPath "URL_Checker_Pro_Windows_x64.zip" -Force
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: URL_Checker_Pro_Windows_x64
+          path: URL_Checker_Pro_Windows_x64.zip
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build-{0}', github.run_number) }}
+          release_name: ${{ startsWith(github.ref, 'refs/tags/') && format('URL Checker Pro {0}', github.ref_name) || format('Auto Build #{0}', github.run_number) }}
+          files: URL_Checker_Pro_Windows_x64.zip
+          generate_release_notes: true
