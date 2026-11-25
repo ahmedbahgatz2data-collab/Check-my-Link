@@ -9,7 +9,7 @@ from tkinter import filedialog, messagebox, ttk
 from urllib.parse import urljoin
 
 import customtkinter as ctk
-import openpyx
+import openpyxl
 from openpyxl.styles import Font, PatternFill
 import requests
 from bs4 import BeautifulSoup
